@@ -5,8 +5,6 @@
 *.jpeg
 *.bat
 *.com
-*.txt
-*.nfo
 *.doc
 *.docx
 *.pdf
@@ -33,7 +31,6 @@
 *.ini
 *.dat
 *.tmp
-*.srt
 *.sub
 *.sfv
 *.zipx
@@ -106,4 +103,3 @@
 *.sample.avi
 *.sample.mp4
 *.rar
-

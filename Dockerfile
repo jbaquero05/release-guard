@@ -5,10 +5,11 @@ WORKDIR /app
 COPY go.mod ./
 COPY main.go ./
 
+
 RUN go build \
     -ldflags="-s -w" \
     -o release-guard \
-    main.go
+    .
 
 
 FROM alpine:3.21

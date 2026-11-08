@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -97,6 +99,13 @@ type Config struct {
 
 	StartupCheckRetries       int
 	StartupCheckRetryInterval time.Duration
+
+	CleanupEnabled                  bool
+	CleanupDryRun                   bool
+	CleanupDownloadRoot             string
+	CleanupMediaRoot                string
+	RetroactiveRadarrCleanupEnabled bool
+	RetroactiveSonarrCleanupEnabled bool
 }
 
 type ArrConfig struct {
@@ -128,6 +137,18 @@ type QBFile struct {
 	Size int64  `json:"size"`
 }
 
+type QBTorrentInfo struct {
+	Hash     string `json:"hash"`
+	Name     string `json:"name"`
+	SavePath string `json:"save_path"`
+	State    string `json:"state"`
+	Category string `json:"category"`
+}
+
+type ImportedFile struct {
+	Path string
+}
+
 type App struct {
 	config Config
 
@@ -137,6 +158,9 @@ type App struct {
 
 	qbAuthMutex     sync.Mutex
 	qbAuthenticated bool
+
+	cleanupMu       sync.Mutex
+	cleanupInFlight map[string]struct{}
 }
 
 func main() {
@@ -177,6 +201,7 @@ func main() {
 			Timeout: 20 * time.Second,
 			Jar:     jar,
 		},
+		cleanupInFlight: make(map[string]struct{}),
 	}
 
 	infof(
@@ -262,6 +287,10 @@ func logResolvedConfig(config Config) {
 	infof("  QUEUE_TIMEOUT=%s QUEUE_POLL_INTERVAL=%s", config.QueueTimeout, config.QueuePollInterval)
 	infof("  FORBIDDEN_EXTENSIONS_FILE=%s", config.ForbiddenExtensionsFile)
 	infof("  STARTUP_CHECK_RETRIES=%d STARTUP_CHECK_RETRY_INTERVAL=%s", config.StartupCheckRetries, config.StartupCheckRetryInterval)
+	infof("  CLEANUP_ENABLED=%t CLEANUP_DRY_RUN=%t", config.CleanupEnabled, config.CleanupDryRun)
+	infof("  CLEANUP_DOWNLOAD_ROOT=%q CLEANUP_MEDIA_ROOT=%q", config.CleanupDownloadRoot, config.CleanupMediaRoot)
+	infof("  RETROACTIVE_RADARR_CLEANUP_ENABLED=%t", config.RetroactiveRadarrCleanupEnabled)
+	infof("  RETROACTIVE_SONARR_CLEANUP_ENABLED=%t", config.RetroactiveSonarrCleanupEnabled)
 
 	if config.SonarrAPIKey == "" {
 		warnf("SONARR_API_KEY is empty — requests to Sonarr will be rejected as unauthenticated")
@@ -311,52 +340,64 @@ func (app *App) runStartupChecks() {
 
 	infof("Running startup connectivity checks against qBittorrent, Sonarr, and Radarr...")
 
+	type checkResult struct {
+		name string
+		ok   bool
+	}
+	results := make(chan checkResult, 3)
 	var wg sync.WaitGroup
 	wg.Add(3)
 
 	go func() {
 		defer wg.Done()
-		app.runPreflightCheck(
-			"qBittorrent",
-			app.checkQBittorrentConnectivity,
-		)
+		ok := app.runPreflightCheck("qBittorrent", app.checkQBittorrentConnectivity)
+		results <- checkResult{name: "qBittorrent", ok: ok}
 	}()
 
 	go func() {
 		defer wg.Done()
-		app.runPreflightCheck(
-			"Sonarr",
-			func() error {
-				return app.checkArrConnectivity(
-					ArrConfig{
-						Name:   "Sonarr",
-						URL:    app.config.SonarrURL,
-						APIKey: app.config.SonarrAPIKey,
-					},
-				)
-			},
-		)
+		ok := app.runPreflightCheck("Sonarr", func() error {
+			return app.checkArrConnectivity(ArrConfig{Name: "Sonarr", URL: app.config.SonarrURL, APIKey: app.config.SonarrAPIKey})
+		})
+		results <- checkResult{name: "Sonarr", ok: ok}
 	}()
 
 	go func() {
 		defer wg.Done()
-		app.runPreflightCheck(
-			"Radarr",
-			func() error {
-				return app.checkArrConnectivity(
-					ArrConfig{
-						Name:   "Radarr",
-						URL:    app.config.RadarrURL,
-						APIKey: app.config.RadarrAPIKey,
-					},
-				)
-			},
-		)
+		ok := app.runPreflightCheck("Radarr", func() error {
+			return app.checkArrConnectivity(ArrConfig{Name: "Radarr", URL: app.config.RadarrURL, APIKey: app.config.RadarrAPIKey})
+		})
+		results <- checkResult{name: "Radarr", ok: ok}
 	}()
 
 	wg.Wait()
+	close(results)
+
+	checkResults := make(map[string]bool, 3)
+	for result := range results {
+		checkResults[result.name] = result.ok
+	}
 
 	infof("Startup connectivity checks complete")
+	radarrEnabled := app.config.RetroactiveRadarrCleanupEnabled
+	sonarrEnabled := app.config.RetroactiveSonarrCleanupEnabled
+	if !radarrEnabled && !sonarrEnabled {
+		infof("Retroactive cleanup disabled (both RETROACTIVE_RADARR_CLEANUP_ENABLED and RETROACTIVE_SONARR_CLEANUP_ENABLED are false)")
+		return
+	}
+	if !app.config.CleanupEnabled {
+		warnf("Retroactive cleanup requested but CLEANUP_ENABLED=false; skipping")
+		return
+	}
+	if !checkResults["qBittorrent"] ||
+		(radarrEnabled && !checkResults["Radarr"]) ||
+		(sonarrEnabled && !checkResults["Sonarr"]) {
+		warnf("Retroactive cleanup skipped because a required startup connectivity check failed (qBittorrent is always required; only enabled Arr services are required)")
+		return
+	}
+
+	// This runs exactly once per process startup, after all preflight checks.
+	app.runRetroactiveCleanup(radarrEnabled, sonarrEnabled)
 }
 
 // runPreflightCheck retries the given check up to StartupCheckRetries times,
@@ -366,7 +407,7 @@ func (app *App) runStartupChecks() {
 func (app *App) runPreflightCheck(
 	name string,
 	check func() error,
-) {
+) bool {
 
 	attempts := app.config.StartupCheckRetries
 
@@ -389,7 +430,7 @@ func (app *App) runPreflightCheck(
 				attempts,
 				time.Since(start),
 			)
-			return
+			return true
 		}
 
 		lastErr = err
@@ -413,6 +454,7 @@ func (app *App) runPreflightCheck(
 		attempts,
 		lastErr,
 	)
+	return false
 }
 
 // checkQBittorrentConnectivity forces a fresh login attempt (ignoring any
@@ -583,6 +625,13 @@ func loadConfig() Config {
 				5,
 			),
 		) * time.Second,
+
+		CleanupEnabled:                  getEnvBool("CLEANUP_ENABLED", false),
+		CleanupDryRun:                   getEnvBool("CLEANUP_DRY_RUN", true),
+		CleanupDownloadRoot:             getEnv("CLEANUP_DOWNLOAD_ROOT", ""),
+		CleanupMediaRoot:                getEnv("CLEANUP_MEDIA_ROOT", ""),
+		RetroactiveRadarrCleanupEnabled: getEnvBool("RETROACTIVE_RADARR_CLEANUP_ENABLED", false),
+		RetroactiveSonarrCleanupEnabled: getEnvBool("RETROACTIVE_SONARR_CLEANUP_ENABLED", false),
 	}
 }
 
@@ -768,12 +817,661 @@ func (app *App) webhookHandler(
 			http.StatusOK,
 		)
 
-		go app.processGrab(
-			arr,
-			event,
-			body,
-		)
+		switch strings.ToLower(strings.TrimSpace(event.EventType)) {
+		case "grab":
+			go app.processGrab(arr, event, body)
+		case "download", "import", "upgrade", "onimport", "onupgrade", "onimportcomplete":
+			if app.config.CleanupEnabled {
+				go app.processImport(arr, body)
+			} else {
+				debugf("[%s] Import cleanup event received but CLEANUP_ENABLED=false", arr.Name)
+			}
+		default:
+			debugf("[%s] Ignoring unsupported webhook event type %q", arr.Name, event.EventType)
+		}
 	}
+}
+
+// processImport handles Sonarr/Radarr import notifications. It deliberately
+// uses the raw payload because the two applications expose imported file paths
+// in different nested objects (Radarr movieFile.path, Sonarr episodeFiles[].path).
+func (app *App) processImport(arr ArrConfig, payload []byte) {
+	var event map[string]interface{}
+	if err := json.Unmarshal(payload, &event); err != nil {
+		errorf("[%s] Cannot decode import event: %v", arr.Name, err)
+		return
+	}
+	downloadID, _ := event["downloadId"].(string)
+	downloadID = strings.TrimSpace(downloadID)
+	if downloadID == "" {
+		warnf("[%s] Import event has no downloadId; cleanup skipped", arr.Name)
+		return
+	}
+
+	app.cleanupMu.Lock()
+	if _, exists := app.cleanupInFlight[downloadID]; exists {
+		app.cleanupMu.Unlock()
+		debugf("[%s] Cleanup already in progress for %s; duplicate event ignored", arr.Name, downloadID)
+		return
+	}
+	app.cleanupInFlight[downloadID] = struct{}{}
+	app.cleanupMu.Unlock()
+	defer func() {
+		app.cleanupMu.Lock()
+		delete(app.cleanupInFlight, downloadID)
+		app.cleanupMu.Unlock()
+	}()
+
+	paths := collectImportedPaths(event)
+	if len(paths) == 0 {
+		warnf("[%s] Import event for %s contains no supported imported file paths; cleanup skipped", arr.Name, downloadID)
+		return
+	}
+	if app.config.CleanupDownloadRoot == "" || app.config.CleanupMediaRoot == "" {
+		warnf("[%s] Cleanup is enabled but CLEANUP_DOWNLOAD_ROOT or CLEANUP_MEDIA_ROOT is empty; refusing deletion", arr.Name)
+		return
+	}
+
+	info, err := app.getTorrentInfo(downloadID)
+	if err != nil {
+		errorf("[%s] Could not retrieve qBittorrent info for %s: %v", arr.Name, downloadID, err)
+		return
+	}
+	infof("[%s] Import confirmed for torrent %s (qBittorrent state=%q); verifying copied files immediately", arr.Name, downloadID, info.State)
+
+	files, err := app.getTorrentFiles(downloadID)
+	if err != nil {
+		errorf("[%s] Could not list qBittorrent files for %s: %v", arr.Name, downloadID, err)
+		return
+	}
+
+	type cleanupCandidate struct {
+		source      string
+		destination string
+		size        int64
+		hash        string
+	}
+
+	// Build and verify the complete deletion plan first. Do not start deleting
+	// source files until every imported destination has one unambiguous,
+	// independent qBittorrent source with identical content.
+	var plan []cleanupCandidate
+	seenDestinations := make(map[string]struct{})
+	for _, importedPath := range paths {
+		destination, err := filepath.Abs(filepath.Clean(importedPath))
+		if err != nil || !resolvedPathWithin(app.config.CleanupMediaRoot, destination) {
+			warnf("[%s] Refusing imported path outside CLEANUP_MEDIA_ROOT: %q", arr.Name, importedPath)
+			return
+		}
+		if _, seen := seenDestinations[destination]; seen {
+			debugf("[%s] Duplicate imported path in webhook ignored: %s", arr.Name, destination)
+			continue
+		}
+		seenDestinations[destination] = struct{}{}
+
+		dstInfo, err := os.Lstat(destination)
+		if err != nil || !dstInfo.Mode().IsRegular() || dstInfo.Mode()&os.ModeSymlink != 0 {
+			warnf("[%s] Imported destination is missing or not a regular file: %s", arr.Name, destination)
+			return
+		}
+		destHash, err := sha256File(destination)
+		if err != nil {
+			warnf("[%s] Cannot checksum destination %s: %v", arr.Name, destination, err)
+			return
+		}
+
+		type sourceMatch struct {
+			path string
+			info os.FileInfo
+		}
+		var matches []sourceMatch
+		var hardlinkFound bool
+
+		// Arr can rename imported files, so match by size and SHA-256 rather
+		// than basename. The inode check ensures this is a physical copy,
+		// not a hardlink to the torrent's original data.
+		for _, torrentFile := range files {
+			if torrentFile.Size != dstInfo.Size() {
+				continue
+			}
+			source := filepath.Join(info.SavePath, filepath.FromSlash(torrentFile.Name))
+			source, err = filepath.Abs(filepath.Clean(source))
+			if err != nil || !resolvedPathWithin(app.config.CleanupDownloadRoot, source) {
+				debugf("[%s] Skipping qBittorrent candidate outside CLEANUP_DOWNLOAD_ROOT: %q", arr.Name, source)
+				continue
+			}
+			srcInfo, statErr := os.Lstat(source)
+			if statErr != nil || !srcInfo.Mode().IsRegular() || srcInfo.Mode()&os.ModeSymlink != 0 || srcInfo.Size() != dstInfo.Size() {
+				continue
+			}
+			if os.SameFile(srcInfo, dstInfo) {
+				hardlinkFound = true
+				continue
+			}
+			sourceHash, hashErr := sha256File(source)
+			if hashErr != nil {
+				warnf("[%s] Cannot checksum source candidate %s: %v", arr.Name, source, hashErr)
+				continue
+			}
+			if sourceHash == destHash {
+				matches = append(matches, sourceMatch{path: source, info: srcInfo})
+			}
+		}
+
+		if len(matches) == 0 {
+			if hardlinkFound {
+				infof("[%s] Imported file is hardlinked to its torrent source; refusing torrent removal because no physical copy exists: %s", arr.Name, destination)
+			} else {
+				warnf("[%s] No qBittorrent source matched imported file by size and SHA-256: %s; refusing torrent removal", arr.Name, destination)
+			}
+			return
+		}
+		if len(matches) != 1 {
+			warnf("[%s] Found %d qBittorrent source files with identical content for %s; ambiguous, refusing torrent removal", arr.Name, len(matches), destination)
+			return
+		}
+		plan = append(plan, cleanupCandidate{
+			source: matches[0].path, destination: destination,
+			size: matches[0].info.Size(), hash: destHash,
+		})
+	}
+
+	if len(plan) == 0 {
+		warnf("[%s] No independently copied imported files were verified for %s; torrent retained", arr.Name, downloadID)
+		return
+	}
+
+	if app.config.CleanupDryRun {
+		for _, item := range plan {
+			infof("[%s] CLEANUP DRY RUN: would remove copied source %s (%d bytes); verified imported copy at %s", arr.Name, item.source, item.size, item.destination)
+		}
+		infof("[%s] CLEANUP DRY RUN: would remove torrent %s from qBittorrent and delete its remaining downloaded files", arr.Name, downloadID)
+		return
+	}
+
+	// Re-verify every source/destination pair immediately before deleting any
+	// source, reducing the risk of deleting the only valid copy after a race.
+	for _, item := range plan {
+		sourceHash, sourceErr := sha256File(item.source)
+		destinationHash, destinationErr := sha256File(item.destination)
+		if sourceErr != nil || destinationErr != nil || sourceHash != item.hash || destinationHash != item.hash {
+			warnf("[%s] Source or destination changed during final verification; refusing cleanup and torrent removal (source=%s)", arr.Name, item.source)
+			return
+		}
+		srcInfo, sourceErr := os.Lstat(item.source)
+		dstInfo, destinationErr := os.Lstat(item.destination)
+		if sourceErr != nil || destinationErr != nil || !srcInfo.Mode().IsRegular() || !dstInfo.Mode().IsRegular() || os.SameFile(srcInfo, dstInfo) {
+			warnf("[%s] Source/destination file identity changed during final verification; refusing cleanup and torrent removal (source=%s)", arr.Name, item.source)
+			return
+		}
+	}
+
+	removedBytes := int64(0)
+	for _, item := range plan {
+		if err := os.Remove(item.source); err != nil {
+			errorf("[%s] Failed to remove copied source %s; torrent will be retained in qBittorrent: %v", arr.Name, item.source, err)
+			return
+		}
+		infof("[%s] Removed verified duplicate source %s (%d bytes); imported copy remains at %s", arr.Name, item.source, item.size, item.destination)
+		removedBytes += item.size
+	}
+
+	infof("[%s] Removed %d bytes of verified duplicate source data for torrent %s", arr.Name, removedBytes, downloadID)
+	if err := app.deleteTorrent(downloadID, true); err != nil {
+		errorf("[%s] Source cleanup completed, but failed to remove torrent %s and its remaining files from qBittorrent: %v", arr.Name, downloadID, err)
+		return
+	}
+	infof("[%s] SUCCESS: removed torrent %s from qBittorrent and deleted its remaining downloaded files; imported copies are preserved", arr.Name, downloadID)
+}
+
+// runRetroactiveCleanup performs a one-time startup scan of existing Radarr
+// movie files and Sonarr episode files. It correlates them with qBittorrent
+// torrent files by size and SHA-256, then sends synthetic import payloads
+// through processImport so the exact same safety checks and deletion flow are
+// used for old imports as for new webhook imports.
+func (app *App) runRetroactiveCleanup(radarrEnabled, sonarrEnabled bool) {
+	infof("RETROACTIVE CLEANUP: beginning one-time scan of existing Arr library files")
+	if app.config.CleanupDownloadRoot == "" || app.config.CleanupMediaRoot == "" {
+		warnf("RETROACTIVE CLEANUP: CLEANUP_DOWNLOAD_ROOT or CLEANUP_MEDIA_ROOT is empty; skipping")
+		return
+	}
+
+	// Keep each Arr library isolated from the beginning: Radarr files are
+	// compared only with category=radarr torrents, and Sonarr files only with
+	// category=tv-sonarr torrents.
+	mediaPathsByCategory := map[string]map[string]struct{}{
+		"radarr":    make(map[string]struct{}),
+		"tv-sonarr": make(map[string]struct{}),
+	}
+	for _, item := range []struct {
+		arr                ArrConfig
+		category           string
+		collectionEndpoint string
+		queryParameter     string
+		fileEndpoint       string
+	}{
+		{ArrConfig{Name: "Radarr", URL: app.config.RadarrURL, APIKey: app.config.RadarrAPIKey}, "radarr", "/api/v3/movie", "movieId", "/api/v3/moviefile"},
+		{ArrConfig{Name: "Sonarr", URL: app.config.SonarrURL, APIKey: app.config.SonarrAPIKey}, "tv-sonarr", "/api/v3/series", "seriesId", "/api/v3/episodefile"},
+	} {
+		if (item.category == "radarr" && !radarrEnabled) ||
+			(item.category == "tv-sonarr" && !sonarrEnabled) {
+			infof("RETROACTIVE CLEANUP: skipping %s scan because its startup switch is disabled", item.arr.Name)
+			continue
+		}
+		paths, err := app.getArrMediaFilePaths(item.arr, item.collectionEndpoint, item.queryParameter, item.fileEndpoint)
+		if err != nil {
+			errorf("RETROACTIVE CLEANUP: failed to retrieve %s library files: %v", item.arr.Name, err)
+			continue
+		}
+		infof("RETROACTIVE CLEANUP: retrieved %d existing file records from %s", len(paths), item.arr.Name)
+		for _, path := range paths {
+			absolute, absErr := filepath.Abs(filepath.Clean(path))
+			if absErr != nil || !resolvedPathWithin(app.config.CleanupMediaRoot, absolute) {
+				debugf("RETROACTIVE CLEANUP: ignoring %s library path outside CLEANUP_MEDIA_ROOT: %q", item.arr.Name, path)
+				continue
+			}
+			fi, statErr := os.Lstat(absolute)
+			if statErr != nil || !fi.Mode().IsRegular() || fi.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			mediaPathsByCategory[item.category][absolute] = struct{}{}
+		}
+	}
+
+	mediaCount := len(mediaPathsByCategory["radarr"]) + len(mediaPathsByCategory["tv-sonarr"])
+	if mediaCount == 0 {
+		infof("RETROACTIVE CLEANUP: no existing media files found within CLEANUP_MEDIA_ROOT")
+		return
+	}
+
+	torrents, err := app.getAllTorrentInfo()
+	if err != nil {
+		errorf("RETROACTIVE CLEANUP: could not list qBittorrent torrents: %v", err)
+		return
+	}
+	infof("RETROACTIVE CLEANUP: comparing %d existing media files against qBittorrent torrents (Radarr category=radarr; Sonarr category=tv-sonarr)", mediaCount)
+
+	// Hash library files once. Matching is then constrained by both content
+	// and the category associated with the Arr library that owns the file.
+	mediaHashes := make(map[string]string, mediaCount)
+	mediaSizes := make(map[string]int64, mediaCount)
+	for _, category := range []string{"radarr", "tv-sonarr"} {
+		for path := range mediaPathsByCategory[category] {
+			fi, statErr := os.Stat(path)
+			if statErr != nil {
+				continue
+			}
+			hash, hashErr := sha256File(path)
+			if hashErr != nil {
+				warnf("RETROACTIVE CLEANUP: cannot checksum library file %s: %v", path, hashErr)
+				continue
+			}
+			mediaHashes[path] = hash
+			mediaSizes[path] = fi.Size()
+		}
+	}
+
+	// media path -> distinct matching torrent hashes. Multiple matches are
+	// ambiguous and are deliberately excluded from cleanup.
+	matchedTorrentHashes := make(map[string]map[string]struct{})
+	torrentNames := make(map[string]string, len(torrents))
+	torrentCategories := make(map[string]string, len(torrents))
+	for _, torrent := range torrents {
+		category := strings.ToLower(strings.TrimSpace(torrent.Category))
+		if (category == "radarr" && !radarrEnabled) ||
+			(category == "tv-sonarr" && !sonarrEnabled) {
+			debugf("RETROACTIVE CLEANUP: skipping torrent %q (%s), category=%q (that Arr scan is disabled)", torrent.Name, torrent.Hash, torrent.Category)
+			continue
+		}
+		if category != "radarr" && category != "tv-sonarr" {
+			debugf("RETROACTIVE CLEANUP: skipping torrent %q (%s), category=%q (expected radarr or tv-sonarr)", torrent.Name, torrent.Hash, torrent.Category)
+			continue
+		}
+		if strings.TrimSpace(torrent.Hash) == "" {
+			continue
+		}
+		torrentNames[torrent.Hash] = torrent.Name
+		torrentCategories[torrent.Hash] = category
+		files, filesErr := app.getTorrentFiles(torrent.Hash)
+		if filesErr != nil {
+			warnf("RETROACTIVE CLEANUP: cannot list files for torrent %s (%s): %v", torrent.Name, torrent.Hash, filesErr)
+			continue
+		}
+		for _, torrentFile := range files {
+			if torrentFile.Size <= 0 {
+				continue
+			}
+			source := filepath.Join(torrent.SavePath, filepath.FromSlash(torrentFile.Name))
+			source, absErr := filepath.Abs(filepath.Clean(source))
+			if absErr != nil || !resolvedPathWithin(app.config.CleanupDownloadRoot, source) {
+				continue
+			}
+			sourceInfo, statErr := os.Lstat(source)
+			if statErr != nil || !sourceInfo.Mode().IsRegular() || sourceInfo.Mode()&os.ModeSymlink != 0 || sourceInfo.Size() != torrentFile.Size {
+				continue
+			}
+			sourceHash, hashErr := sha256File(source)
+			if hashErr != nil {
+				continue
+			}
+			for mediaPath := range mediaPathsByCategory[category] {
+				if mediaSizes[mediaPath] != torrentFile.Size || mediaHashes[mediaPath] != sourceHash {
+					continue
+				}
+				mediaInfo, mediaErr := os.Lstat(mediaPath)
+				if mediaErr != nil || os.SameFile(sourceInfo, mediaInfo) {
+					continue
+				}
+				if matchedTorrentHashes[mediaPath] == nil {
+					matchedTorrentHashes[mediaPath] = make(map[string]struct{})
+				}
+				matchedTorrentHashes[mediaPath][torrent.Hash] = struct{}{}
+			}
+		}
+	}
+
+	type torrentCandidate struct {
+		category string
+		paths    []string
+	}
+	candidates := make(map[string]*torrentCandidate)
+	for mediaPath, hashes := range matchedTorrentHashes {
+		if len(hashes) != 1 {
+			if len(hashes) > 1 {
+				warnf("RETROACTIVE CLEANUP: library file matches %d torrents; ambiguous, leaving untouched: %s", len(hashes), mediaPath)
+			}
+			continue
+		}
+		for hash := range hashes {
+			if candidates[hash] == nil {
+				candidates[hash] = &torrentCandidate{category: torrentCategories[hash]}
+			}
+			candidates[hash].paths = append(candidates[hash].paths, mediaPath)
+		}
+	}
+	if len(candidates) == 0 {
+		infof("RETROACTIVE CLEANUP: no unambiguous pre-existing file/torrent combinations found")
+		return
+	}
+
+	infof("RETROACTIVE CLEANUP: found %d candidate torrent/library combinations", len(candidates))
+	for hash, candidate := range candidates {
+		var payload map[string]interface{}
+		var arr ArrConfig
+		if candidate.category == "radarr" {
+			arr = ArrConfig{Name: "Radarr", URL: app.config.RadarrURL, APIKey: app.config.RadarrAPIKey}
+			payload = map[string]interface{}{
+				"eventType":    "Import",
+				"downloadId":   hash,
+				"movieFile":    map[string]interface{}{"path": candidate.paths[0]},
+				"episodeFiles": []interface{}{},
+			}
+		} else {
+			arr = ArrConfig{Name: "Sonarr", URL: app.config.SonarrURL, APIKey: app.config.SonarrAPIKey}
+			episodeFiles := make([]interface{}, 0, len(candidate.paths))
+			for _, path := range candidate.paths {
+				episodeFiles = append(episodeFiles, map[string]interface{}{"path": path})
+			}
+			payload = map[string]interface{}{
+				"eventType":    "Import",
+				"downloadId":   hash,
+				"episodeFiles": episodeFiles,
+			}
+		}
+		encodedPayload, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			warnf("RETROACTIVE CLEANUP: could not construct import payload for %s: %v", hash, marshalErr)
+			continue
+		}
+		infof("RETROACTIVE CLEANUP: applying %s cleanup checks to torrent %q (%s), category=%s, matched library files=%d", arr.Name, torrentNames[hash], hash, candidate.category, len(candidate.paths))
+		app.processImport(arr, encodedPayload)
+	}
+	infof("RETROACTIVE CLEANUP: one-time startup scan complete")
+}
+
+func (app *App) getArrMediaFilePaths(arr ArrConfig, collectionEndpoint, queryParameter, fileEndpoint string) ([]string, error) {
+	// Radarr's /moviefile and Sonarr's /episodefile endpoints require a
+	// movieId or seriesId respectively; calling them without a query returns
+	// HTTP 400. Enumerate the parent records first, then retrieve files for
+	// each parent ID.
+	collectionURL := strings.TrimRight(arr.URL, "/") + collectionEndpoint
+	request, err := http.NewRequest(http.MethodGet, collectionURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("X-Api-Key", arr.APIKey)
+	client := &http.Client{Timeout: 60 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	body, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s returned HTTP %d: %s", collectionEndpoint, response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var parents []struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal(body, &parents); err != nil {
+		return nil, fmt.Errorf("decoding %s response: %w", collectionEndpoint, err)
+	}
+
+	paths := make([]string, 0)
+	for _, parent := range parents {
+		if parent.ID <= 0 {
+			continue
+		}
+		fileURL, err := url.Parse(strings.TrimRight(arr.URL, "/") + fileEndpoint)
+		if err != nil {
+			return nil, err
+		}
+		query := fileURL.Query()
+		query.Set(queryParameter, strconv.Itoa(parent.ID))
+		fileURL.RawQuery = query.Encode()
+
+		fileRequest, err := http.NewRequest(http.MethodGet, fileURL.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		fileRequest.Header.Set("X-Api-Key", arr.APIKey)
+		fileResponse, err := client.Do(fileRequest)
+		if err != nil {
+			return nil, fmt.Errorf("requesting %s for %s ID %d: %w", fileEndpoint, queryParameter, parent.ID, err)
+		}
+		fileBody, readErr := io.ReadAll(fileResponse.Body)
+		fileResponse.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if fileResponse.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("%s?%s=%d returned HTTP %d: %s", fileEndpoint, queryParameter, parent.ID, fileResponse.StatusCode, strings.TrimSpace(string(fileBody)))
+		}
+		var records []struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(fileBody, &records); err != nil {
+			return nil, fmt.Errorf("decoding %s response for %s ID %d: %w", fileEndpoint, queryParameter, parent.ID, err)
+		}
+		for _, record := range records {
+			if strings.TrimSpace(record.Path) != "" {
+				paths = append(paths, record.Path)
+			}
+		}
+	}
+	return paths, nil
+}
+
+func (app *App) getAllTorrentInfo() ([]QBTorrentInfo, error) {
+	if err := app.qbLogin(); err != nil {
+		return nil, err
+	}
+	request, err := app.newQBRequest(http.MethodGet, app.config.QBittorrentURL+"/api/v2/torrents/info", nil)
+	if err != nil {
+		return nil, err
+	}
+	response, err := app.qbClient.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		app.qbAuthMutex.Lock()
+		app.qbAuthenticated = false
+		app.qbAuthMutex.Unlock()
+		return nil, fmt.Errorf("qBittorrent authentication rejected (HTTP %d)", response.StatusCode)
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("qBittorrent torrent list returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var torrents []QBTorrentInfo
+	if err := json.Unmarshal(body, &torrents); err != nil {
+		return nil, err
+	}
+	return torrents, nil
+}
+
+func collectImportedPaths(event map[string]interface{}) []string {
+	var result []string
+	add := func(v interface{}) {
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			return
+		}
+		if p, ok := m["path"].(string); ok && strings.TrimSpace(p) != "" {
+			result = append(result, p)
+		}
+	}
+	add(event["movieFile"])
+	if list, ok := event["episodeFiles"].([]interface{}); ok {
+		for _, item := range list {
+			add(item)
+		}
+	}
+	add(event["episodeFile"])
+	return result
+}
+
+func pathWithin(root, candidate string) bool {
+	r, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return false
+	}
+	c, err := filepath.Abs(filepath.Clean(candidate))
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(r, c)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
+}
+
+func resolvedPathWithin(root, candidate string) bool {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false
+	}
+	resolvedCandidate, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return false
+	}
+	return pathWithin(resolvedRoot, resolvedCandidate)
+}
+
+func sha256File(filename string) (string, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// deleteTorrent removes a torrent from qBittorrent using the same authenticated
+// WebUI client/session used by the rest of Release Guard. When deleteFiles is
+// true, qBittorrent also deletes any remaining files belonging to the torrent.
+func (app *App) deleteTorrent(hash string, deleteFiles bool) error {
+	if err := app.qbLogin(); err != nil {
+		return fmt.Errorf("authenticating with qBittorrent before torrent removal: %w", err)
+	}
+
+	form := url.Values{}
+	form.Set("hashes", hash)
+	form.Set("deleteFiles", strconv.FormatBool(deleteFiles))
+	requestURL := app.config.QBittorrentURL + "/api/v2/torrents/delete"
+	request, err := app.newQBRequest(http.MethodPost, requestURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return fmt.Errorf("building qBittorrent torrent removal request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	start := time.Now()
+	response, err := app.qbClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("calling qBittorrent torrent removal API: %w", err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		app.qbAuthMutex.Lock()
+		app.qbAuthenticated = false
+		app.qbAuthMutex.Unlock()
+		return fmt.Errorf("qBittorrent rejected torrent removal as unauthenticated (HTTP %d): %s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("qBittorrent torrent removal returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	infof("qBittorrent accepted torrent removal for %s (deleteFiles=%t, %s)", hash, deleteFiles, time.Since(start))
+	return nil
+}
+
+func (app *App) getTorrentInfo(hash string) (QBTorrentInfo, error) {
+	if err := app.qbLogin(); err != nil {
+		return QBTorrentInfo{}, err
+	}
+	u := app.config.QBittorrentURL + "/api/v2/torrents/info?hashes=" + url.QueryEscape(hash)
+	req, err := app.newQBRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return QBTorrentInfo{}, err
+	}
+	resp, err := app.qbClient.Do(req)
+	if err != nil {
+		return QBTorrentInfo{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return QBTorrentInfo{}, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		app.qbAuthMutex.Lock()
+		app.qbAuthenticated = false
+		app.qbAuthMutex.Unlock()
+		return QBTorrentInfo{}, fmt.Errorf("qBittorrent authentication rejected (HTTP %d)", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return QBTorrentInfo{}, fmt.Errorf("qBittorrent torrent info HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var items []QBTorrentInfo
+	if err := json.Unmarshal(body, &items); err != nil {
+		return QBTorrentInfo{}, err
+	}
+	if len(items) != 1 {
+		return QBTorrentInfo{}, fmt.Errorf("expected one torrent for hash %s, got %d", hash, len(items))
+	}
+	return items[0], nil
 }
 
 func (app *App) processGrab(
@@ -1026,6 +1724,7 @@ func (app *App) processGrab(
 		arr.Name,
 		time.Since(start),
 	)
+
 }
 
 func (app *App) isForbidden(
@@ -1045,9 +1744,7 @@ func (app *App) isForbidden(
 		return false
 	}
 
-	_, exists := app.forbiddenExtensions[
-		extension,
-	]
+	_, exists := app.forbiddenExtensions[extension]
 
 	return exists
 }

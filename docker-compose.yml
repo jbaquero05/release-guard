@@ -1,0 +1,65 @@
+
+services:
+  release-guard:
+    container_name: release-guard
+    image: release-guard:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+
+    environment:
+      TZ: America/Bogota
+      LOG_LEVEL: INFO
+
+      # Sonarr
+      SONARR_URL: http://sonarr:8989
+      SONARR_API_KEY: ${SONARR_API_KEY}
+
+      # Radarr
+      RADARR_URL: http://radarr:7878
+      RADARR_API_KEY: ${RADARR_API_KEY}
+
+      # qBittorrent
+      QBITTORRENT_URL: http://qbittorrent:8080
+      QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:-admin}
+      QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD}
+
+      # Discord notifications (optional)
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+
+      # Forbidden file extensions
+      FORBIDDEN_EXTENSIONS_FILE: /config/forbidden_extensions.txt
+
+      # Duplicate cleanup
+      CLEANUP_ENABLED: "true"
+      CLEANUP_DRY_RUN: "true"
+
+      # Paths as seen from inside Release Guard
+      CLEANUP_DOWNLOAD_ROOT: /data/torrents
+      CLEANUP_MEDIA_ROOT: /data/media
+
+      CLEANUP_STOP_WAIT: 168h
+      CLEANUP_STOP_POLL_INTERVAL: 5m
+
+      
+      RETROACTIVE_RADARR_CLEANUP_ENABLED: "true"
+      RETROACTIVE_SONARR_CLEANUP_ENABLED: "false"
+
+    volumes:
+      - /mnt/storage_pool/data:/data:rw
+      - /mnt/ssd0/config/release-guard/forbidden_extensions.txt:/config/forbidden_extensions.txt:ro
+
+    networks:
+      - media
+      - ezarr_default
+
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  media:
+    external: true
+  ezarr_default:
+    external: true
